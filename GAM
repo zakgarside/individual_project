@@ -1,0 +1,224 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pygam import LinearGAM, s
+
+CSV_PATH = "data/synthetic_vehicle_data.csv"
+OUTPUT_FILE = "data/gam_soh_results_pct_fc.csv"
+
+SOH_REFERENCE_MODE = "manual"
+SOH_REFERENCE_VALUE = 1.00
+
+MIN_DISTANCE = 1.0
+N_SPLINES = 6
+USE_GRIDSEARCH = True
+SAVE_PLOTS = True
+PLOTS_FOLDER = "plots"
+
+BIN_COLS = [f"b{i}" for i in range(1, 10)]
+
+os.makedirs(PLOTS_FOLDER, exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
+df = pd.read_csv(CSV_PATH)
+
+required_cols = [
+    "age_days",
+    "distance",
+    "MPGi",
+    "SOH",
+    "temperature",
+    "service_interval",
+    *BIN_COLS,
+]
+
+missing = [col for col in required_cols if col not in df.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+df = df.dropna(subset=required_cols).copy()
+
+df["age_years"] = df["age_days"] / 365
+df["trip_distance"] = df["distance"]
+df["mpg"] = df["MPGi"]
+df["Temp"] = df["temperature"]
+df["ServiceDays"] = df["service_interval"]
+
+df = df.sort_values("age_years").reset_index(drop=True)
+
+df = df[
+    (df["mpg"] > 0)
+    & (df["trip_distance"] >= MIN_DISTANCE)
+].copy()
+
+df = df.reset_index(drop=True)
+
+if len(df) < 20:
+    raise ValueError("Too few valid rows after filtering.")
+
+for col in BIN_COLS:
+    df[f"{col}_frac"] = df[col] / df["trip_distance"]
+
+BIN_FRAC_COLS = [f"{col}_frac" for col in BIN_COLS]
+
+df = df.replace([np.inf, -np.inf], np.nan)
+df = df.dropna(subset=BIN_FRAC_COLS).copy()
+df = df.reset_index(drop=True)
+
+feature_cols = ["SOH", "Temp", "ServiceDays"] + BIN_FRAC_COLS
+
+X = df[feature_cols].to_numpy(dtype=float)
+y = df["mpg"].to_numpy(dtype=float)
+
+if SOH_REFERENCE_MODE == "max":
+    soh_ref = float(df["SOH"].max())
+elif SOH_REFERENCE_MODE == "first":
+    soh_ref = float(df["SOH"].iloc[0])
+elif SOH_REFERENCE_MODE == "manual":
+    soh_ref = float(SOH_REFERENCE_VALUE)
+else:
+    raise ValueError("Invalid SOH_REFERENCE_MODE")
+
+print(f"Using SOH reference value: {soh_ref:.4f}")
+
+gam = LinearGAM(
+    s(0, n_splines=N_SPLINES) +
+    s(1, n_splines=N_SPLINES) +
+    s(2, n_splines=N_SPLINES) +
+    s(3, n_splines=N_SPLINES) +
+    s(4, n_splines=N_SPLINES) +
+    s(5, n_splines=N_SPLINES) +
+    s(6, n_splines=N_SPLINES) +
+    s(7, n_splines=N_SPLINES) +
+    s(8, n_splines=N_SPLINES) +
+    s(9, n_splines=N_SPLINES) +
+    s(10, n_splines=N_SPLINES) +
+    s(11, n_splines=N_SPLINES)
+)
+
+if USE_GRIDSEARCH:
+    gam.gridsearch(X, y, progress=True)
+else:
+    gam.fit(X, y)
+
+print("\nModel fitted.")
+print(gam.summary())
+
+df["mpg_pred_actual"] = gam.predict(X)
+
+X_healthy = X.copy()
+X_healthy[:, 0] = soh_ref
+
+df["mpg_pred_healthy"] = gam.predict(X_healthy)
+
+df["fc_pred_actual"] = 1 / df["mpg_pred_actual"]
+df["fc_pred_healthy"] = 1 / df["mpg_pred_healthy"]
+df["fc_obs"] = 1 / df["mpg"]
+
+df["FC_SOH_pct"] = 100 * (
+    (df["fc_pred_actual"] - df["fc_pred_healthy"])
+    / df["fc_pred_healthy"]
+)
+
+df["FC_obs_vs_healthy_pct"] = 100 * (
+    (df["fc_obs"] - df["fc_pred_healthy"])
+    / df["fc_pred_healthy"]
+)
+
+df.to_csv(OUTPUT_FILE, index=False)
+print(f"\nSaved results to {OUTPUT_FILE}")
+
+plt.figure(figsize=(8, 6))
+plt.scatter(df["mpg"], df["mpg_pred_actual"], alpha=0.5)
+
+lims = [
+    min(df["mpg"].min(), df["mpg_pred_actual"].min()),
+    max(df["mpg"].max(), df["mpg_pred_actual"].max()),
+]
+
+plt.plot(lims, lims, linestyle="--")
+plt.xlabel("Observed mpg")
+plt.ylabel("Predicted mpg")
+plt.title("Observed vs Predicted Daily Fuel Economy")
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/plot_observed_vs_predicted.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+axes = axes.flatten()
+
+titles = [
+    "SOH effect",
+    "Temperature effect",
+    "Days-since-service effect",
+    "Example speed-bin effect",
+]
+
+xlabels = [
+    "SOH",
+    "Temp (°C)",
+    "Days since service",
+    "Fraction of distance in b6",
+]
+
+x_base = np.median(X, axis=0)
+plot_indices = [0, 1, 2, 8]
+
+for ax, idx, title, xlabel in zip(axes, plot_indices, titles, xlabels):
+    x_grid = np.linspace(X[:, idx].min(), X[:, idx].max(), 200)
+
+    X_plot = np.tile(x_base, (len(x_grid), 1))
+    X_plot[:, idx] = x_grid
+
+    mpg_grid = gam.predict(X_plot)
+    fc_grid = 1 / mpg_grid
+
+    if idx == 0:
+        x_ref = x_base.copy()
+        x_ref[idx] = soh_ref
+        fc_ref = 1 / gam.predict(x_ref.reshape(1, -1))[0]
+    elif idx == 2:
+        x_ref = x_base.copy()
+        x_ref[idx] = X[:, idx].min()
+        fc_ref = 1 / gam.predict(x_ref.reshape(1, -1))[0]
+    else:
+        fc_ref = fc_grid.min()
+
+    pct_increase = 100 * (fc_grid - fc_ref) / fc_ref
+
+    ax.plot(x_grid, pct_increase)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("% increase in fuel consumption")
+    ax.grid()
+
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/plot_gam_effects_pct_fc.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.scatter(df["age_years"], df["FC_SOH_pct"], alpha=0.3)
+plt.xlabel("Vehicle age (years)")
+plt.ylabel("% increase in fuel consumption")
+plt.title("Daily Fuel-Consumption Increase Attributable to Battery SOH")
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/plot_soh_pct_fc_vs_age.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+latest_row = df.iloc[-1]
+
+print("\nLatest estimated SOH-attributable fuel-consumption increase:")
+print(f"Vehicle age: {latest_row['age_years']:.2f} years")
+print(f"FC_SOH_pct: {latest_row['FC_SOH_pct']:.4f}%")
+
+print("\nDone.")
