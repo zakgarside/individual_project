@@ -2,8 +2,6 @@ import os
 import numpy as np
 import pandas as pd
 
-# Data simulator code
-
 NUM_DAYS = 2920          
 SEED = 42
 OUTPUT_FILE = "data/synthetic_vehicle_data.csv"
@@ -160,6 +158,80 @@ columns = (
 df = pd.DataFrame(rows, columns=columns)
 df.to_csv(OUTPUT_FILE, index=False, na_rep="N/A")
 
-print(f"Dataset generated and saved to: {OUTPUT_FILE}")
-print(df.head())  
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
 
+INPUT_FILE = "data/synthetic_vehicle_data.csv"
+
+os.makedirs("plots", exist_ok=True)
+
+df = pd.read_csv(INPUT_FILE)
+t = df["age_days"] / 365
+
+# SOH
+plt.figure()
+plt.plot(t, df["SOH"])
+plt.title("State of Health over Time")
+plt.xlabel("Years")
+plt.ylabel("SOH")
+plt.grid()
+plt.savefig("plots/soh_over_time.png", dpi=300, bbox_inches="tight")
+
+# MPGi
+plt.figure()
+plt.plot(t, df["MPGi"])
+plt.title("MPGi over Time")
+plt.xlabel("Years")
+plt.ylabel("MPGi")
+plt.grid()
+plt.savefig("plots/mpgi_over_time.png", dpi=300, bbox_inches="tight")
+
+# Distance
+plt.figure()
+plt.plot(t, df["distance"])
+plt.title("Daily Distance")
+plt.xlabel("Years")
+plt.ylabel("Miles")
+plt.grid()
+plt.savefig("plots/distance_over_time.png", dpi=300, bbox_inches="tight")
+
+# Temperature
+plt.figure()
+plt.plot(t, df["temperature"])
+plt.title("Ambient Temperature over Time")
+plt.xlabel("Years")
+plt.ylabel("Temperature (°C)")
+plt.grid()
+plt.savefig("plots/temperature_over_time.png", dpi=300, bbox_inches="tight")
+
+# Fuel consumption components (if present)
+fc_cols = ["FC_trip", "FC_soh", "FC_service", "FC_temp"]
+fc_cols = [c for c in fc_cols if c in df.columns]
+
+if fc_cols:
+    plt.figure()
+    for col in fc_cols:
+        plt.plot(t, df[col], label=col)
+    plt.title("Fuel Consumption Factors over Time")
+    plt.xlabel("Years")
+    plt.ylabel("Factor")
+    plt.legend()
+    plt.grid()
+    plt.savefig("plots/fc_components_over_time.png", dpi=300, bbox_inches="tight")
+
+# Service interval
+plt.figure()
+plt.plot(t, df["service_interval"])
+plt.title("Days Since Service over Time")
+plt.xlabel("Years")
+plt.ylabel("Days Since Service")
+plt.grid()
+plt.savefig("plots/days_since_service_over_time.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+print("Plots saved in 'plots'")
+
+print(f"Dataset generated and saved to: {OUTPUT_FILE}")
+print(df.head())
