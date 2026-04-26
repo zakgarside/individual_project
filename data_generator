@@ -1,0 +1,165 @@
+import os
+import numpy as np
+import pandas as pd
+
+# Data simulator code
+
+NUM_DAYS = 2920          
+SEED = 42
+OUTPUT_FILE = "data/synthetic_vehicle_data.csv"
+
+np.random.seed(SEED)
+
+os.makedirs("data", exist_ok=True)
+os.makedirs("plots", exist_ok=True)
+os.makedirs("models", exist_ok=True)
+
+MPG_BASE = 50.0
+
+# Fuel consumption factors assigned to each speed bin
+FC_BINS = np.array([2.14, 1.50, 1.25, 1.11, 1.03, 1.00, 1.06, 1.13, 1.20])
+
+# Trip profiles: distance travelled in each speed bin
+COMMUTE = np.array([1, 2, 4, 2, 0, 16, 0, 0, 0], dtype=float)
+SHOP = np.array([1, 1, 2, 4, 0, 0, 0, 0, 0], dtype=float)
+EXCURSION = np.array([0, 2, 4, 4, 0, 8, 2, 10, 35], dtype=float)
+LONG_TRIP = np.array([0, 2, 8, 2, 0, 40, 10, 100, 140], dtype=float)
+
+# Probability of each trip type occurring on a given day
+P_COMMUTE = 5 / 7
+P_SHOP = 1 / 7
+P_EXCURSION = 1 / 14
+P_LONG = 1 / 30
+
+def calculate_soh(day: int) -> float:
+    """Return battery state of health as a function of vehicle age."""
+    years = day / 365
+    return np.sqrt(1 - (years / 8) ** 2)
+
+
+def calculate_fc_soh(soh_value: float) -> float:
+    """Return fuel-consumption factor associated with battery SOH."""
+    return 1 + 0.15 / (1 + np.exp(-17 * (0.7 - soh_value)))
+
+
+def calculate_fc_service(service_interval: int) -> float:
+    """Return fuel-consumption factor associated with time since service."""
+    return 1 + 0.1 * (service_interval / 365)
+
+
+def generate_temperature(day: int) -> float:
+    """Return daily ambient temperature with seasonal variation and noise."""
+    seasonal_temperature = 14 * np.cos(2 * np.pi * day / 365) + 14
+    daily_noise = np.random.normal(0, 2)
+    return seasonal_temperature + daily_noise
+
+
+def calculate_fc_temp(temp_c: float) -> float:
+    """Return fuel-consumption factor associated with ambient temperature."""
+    return (0.0114 * temp_c**2 - 0.2744 * temp_c + 7.54) / 5.89
+
+
+def generate_trip() -> np.ndarray:
+    """Generate daily speed-bin distances from probabilistic trip selection."""
+    trips = []
+
+    if np.random.rand() < P_COMMUTE:
+        trips.append(COMMUTE)
+
+    if np.random.rand() < P_SHOP:
+        trips.append(SHOP)
+
+    if np.random.rand() < P_EXCURSION:
+        trips.append(EXCURSION)
+
+    if np.random.rand() < P_LONG:
+        trips.append(LONG_TRIP)
+
+    if not trips:
+        return np.full(9, np.nan)
+
+    return np.sum(trips, axis=0)
+
+
+def calculate_fc_trip(distance_vector: np.ndarray) -> float:
+    """Return distance-weighted speed-profile fuel-consumption factor."""
+    if np.isnan(distance_vector).all():
+        return np.nan
+
+    total_distance = np.nansum(distance_vector)
+
+    if total_distance == 0:
+        return np.nan
+
+    return np.nansum(distance_vector * FC_BINS) / total_distance
+
+rows = []
+service_interval = 0
+
+for day in range(NUM_DAYS):
+    distance_vector = generate_trip()
+
+    no_trip_day = np.isnan(distance_vector).all()
+    total_distance = np.nan if no_trip_day else np.sum(distance_vector)
+
+    soh_value = calculate_soh(day)
+    temperature_value = generate_temperature(day)
+
+    fc_soh_value = calculate_fc_soh(soh_value)
+    fc_service_value = calculate_fc_service(service_interval)
+    fc_temp_value = calculate_fc_temp(temperature_value)
+
+    if no_trip_day:
+        fc_trip_value = np.nan
+        mpg_value = np.nan
+    else:
+        fc_trip_value = calculate_fc_trip(distance_vector)
+        mpg_value = MPG_BASE / (
+            fc_trip_value *
+            fc_soh_value *
+            fc_service_value *
+            fc_temp_value
+        )
+
+    rows.append([
+        day,
+        *distance_vector,
+        total_distance,
+        soh_value,
+        service_interval,
+        temperature_value,
+        fc_trip_value,
+        fc_soh_value,
+        fc_service_value,
+        fc_temp_value,
+        mpg_value
+    ])
+
+    service_interval += 1
+
+    if service_interval >= 365:
+        service_interval = 0
+
+
+columns = (
+    ["age_days"]
+    + [f"b{i+1}" for i in range(9)]
+    + [
+        "distance",
+        "SOH",
+        "service_interval",
+        "temperature",
+        "FC_trip",
+        "FC_soh",
+        "FC_service",
+        "FC_temp",
+        "MPGi"
+    ]
+)
+
+df = pd.DataFrame(rows, columns=columns)
+df.to_csv(OUTPUT_FILE, index=False, na_rep="N/A")
+
+print(f"Dataset generated and saved to: {OUTPUT_FILE}")
+print(df.head())  
+
