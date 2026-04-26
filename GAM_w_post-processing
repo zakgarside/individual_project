@@ -1,0 +1,323 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pygam import LinearGAM, s
+
+CSV_PATH = "data/synthetic_vehicle_data.csv"
+PLOTS_FOLDER = "plots"
+
+SAVE_PLOTS = True
+MIN_DISTANCE = 1.0
+N_SPLINES = 6
+USE_GRIDSEARCH = True
+
+SOH_REFERENCE_MODE = "max"
+SOH_REFERENCE_VALUE = 1.00
+
+EWMA_SPAN = 100
+ROLLING_WINDOW = 365
+ROLLING_MIN_PERIODS = 30
+
+BIN_COLS = [f"b{i}" for i in range(1, 10)]
+
+os.makedirs(PLOTS_FOLDER, exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
+
+def fc_temp_generator(temp):
+    temp = np.asarray(temp, dtype=float)
+    return (0.0114 * temp**2 - 0.2744 * temp + 7.54) / 5.89
+
+
+def fc_service_generator(service_days):
+    service_days = np.asarray(service_days, dtype=float)
+    return 1 + 0.1 * (service_days / 365)
+
+
+def fc_soh_generator(soh):
+    soh = np.asarray(soh, dtype=float)
+    return 1 + 0.15 / (1 + np.exp(-17 * (0.7 - soh)))
+
+
+def mae(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+
+def rmse(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
+
+
+df = pd.read_csv(CSV_PATH)
+
+required_cols = [
+    "age_days",
+    "distance",
+    "MPGi",
+    "SOH",
+    "temperature",
+    "service_interval",
+    *BIN_COLS,
+]
+
+missing = [col for col in required_cols if col not in df.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+df = df.dropna(subset=required_cols).copy()
+
+df["age_years"] = df["age_days"] / 365
+df["trip_distance"] = df["distance"]
+df["mpg"] = df["MPGi"]
+df["Temp"] = df["temperature"]
+df["ServiceDays"] = df["service_interval"]
+
+df = df[
+    (df["mpg"] > 0)
+    & (df["trip_distance"] >= MIN_DISTANCE)
+].copy()
+
+df = df.sort_values("age_years").reset_index(drop=True)
+
+if len(df) < 20:
+    raise ValueError("Too few valid rows after filtering.")
+
+for col in BIN_COLS:
+    df[f"{col}_frac"] = df[col] / df["trip_distance"]
+
+BIN_FRAC_COLS = [f"{col}_frac" for col in BIN_COLS]
+
+df = df.replace([np.inf, -np.inf], np.nan)
+df = df.dropna(subset=BIN_FRAC_COLS).reset_index(drop=True)
+
+feature_cols = ["SOH", "Temp", "ServiceDays"] + BIN_FRAC_COLS
+
+X = df[feature_cols].to_numpy(dtype=float)
+y = df["mpg"].to_numpy(dtype=float)
+
+if SOH_REFERENCE_MODE == "max":
+    soh_ref = float(df["SOH"].max())
+elif SOH_REFERENCE_MODE == "first":
+    soh_ref = float(df["SOH"].iloc[0])
+elif SOH_REFERENCE_MODE == "manual":
+    soh_ref = float(SOH_REFERENCE_VALUE)
+else:
+    raise ValueError("Invalid SOH_REFERENCE_MODE")
+
+print(f"Using SOH reference value: {soh_ref:.4f}")
+
+gam = LinearGAM(
+    s(0, n_splines=N_SPLINES) +
+    s(1, n_splines=N_SPLINES) +
+    s(2, n_splines=N_SPLINES) +
+    s(3, n_splines=N_SPLINES) +
+    s(4, n_splines=N_SPLINES) +
+    s(5, n_splines=N_SPLINES) +
+    s(6, n_splines=N_SPLINES) +
+    s(7, n_splines=N_SPLINES) +
+    s(8, n_splines=N_SPLINES) +
+    s(9, n_splines=N_SPLINES) +
+    s(10, n_splines=N_SPLINES) +
+    s(11, n_splines=N_SPLINES)
+)
+
+if USE_GRIDSEARCH:
+    gam.gridsearch(X, y, progress=True)
+else:
+    gam.fit(X, y)
+
+print("\nGAM fitted.")
+print(gam.summary())
+
+x_base = np.median(X, axis=0)
+
+# Temperature comparison
+temp_grid = np.linspace(df["Temp"].min(), df["Temp"].max(), 300)
+
+X_temp = np.tile(x_base, (len(temp_grid), 1))
+X_temp[:, 1] = temp_grid
+
+fc_temp_gam = 1 / gam.predict(X_temp)
+fc_temp_gam_ref = fc_temp_gam.min()
+temp_pct_gam = 100 * (fc_temp_gam - fc_temp_gam_ref) / fc_temp_gam_ref
+
+fc_temp_true = fc_temp_generator(temp_grid)
+fc_temp_true_ref = fc_temp_true.min()
+temp_pct_true = 100 * (fc_temp_true - fc_temp_true_ref) / fc_temp_true_ref
+
+plt.figure(figsize=(8, 6))
+plt.plot(temp_grid, temp_pct_true, label="Generator", linewidth=2)
+plt.plot(temp_grid, temp_pct_gam, label="GAM", linestyle="--", linewidth=2)
+plt.xlabel("Temperature (°C)")
+plt.ylabel("% increase in fuel consumption")
+plt.title("Temperature Effect: Generator vs GAM")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/section5_temperature_overlay.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+# Service interval comparison
+service_grid = np.linspace(df["ServiceDays"].min(), df["ServiceDays"].max(), 300)
+
+X_service = np.tile(x_base, (len(service_grid), 1))
+X_service[:, 2] = service_grid
+
+fc_service_gam = 1 / gam.predict(X_service)
+
+x_ref = x_base.copy()
+x_ref[2] = service_grid.min()
+fc_service_gam_ref = 1 / gam.predict(x_ref.reshape(1, -1))[0]
+
+service_pct_gam = 100 * (fc_service_gam - fc_service_gam_ref) / fc_service_gam_ref
+
+fc_service_true = fc_service_generator(service_grid)
+fc_service_true_ref = fc_service_generator([service_grid.min()])[0]
+service_pct_true = 100 * (fc_service_true - fc_service_true_ref) / fc_service_true_ref
+
+plt.figure(figsize=(8, 6))
+plt.plot(service_grid, service_pct_true, label="Generator", linewidth=2)
+plt.plot(service_grid, service_pct_gam, label="GAM", linestyle="--", linewidth=2)
+plt.xlabel("Days since service")
+plt.ylabel("% increase in fuel consumption")
+plt.title("Service Interval Effect: Generator vs GAM")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/section5_service_overlay.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+# SOH comparison
+soh_grid = np.linspace(df["SOH"].min(), df["SOH"].max(), 300)
+
+X_soh = np.tile(x_base, (len(soh_grid), 1))
+X_soh[:, 0] = soh_grid
+
+fc_soh_gam = 1 / gam.predict(X_soh)
+
+x_ref = x_base.copy()
+x_ref[0] = soh_ref
+fc_soh_gam_ref = 1 / gam.predict(x_ref.reshape(1, -1))[0]
+
+soh_pct_gam = 100 * (fc_soh_gam - fc_soh_gam_ref) / fc_soh_gam_ref
+
+fc_soh_true = fc_soh_generator(soh_grid)
+fc_soh_true_ref = fc_soh_generator([soh_ref])[0]
+soh_pct_true = 100 * (fc_soh_true - fc_soh_true_ref) / fc_soh_true_ref
+
+plt.figure(figsize=(8, 6))
+plt.plot(soh_grid, soh_pct_true, label="Generator", linewidth=2)
+plt.plot(soh_grid, soh_pct_gam, label="GAM", linestyle="--", linewidth=2)
+plt.xlabel("SOH")
+plt.ylabel("% increase in fuel consumption")
+plt.title("SOH Effect: Generator vs GAM")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/section5_soh_overlay.png", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+# Time-dependent SOH estimate
+fc_soh_true_daily = fc_soh_generator(df["SOH"].to_numpy())
+fc_soh_ref = fc_soh_generator([soh_ref])[0]
+
+df["FC_SOH_true_pct"] = 100 * (fc_soh_true_daily - fc_soh_ref) / fc_soh_ref
+
+X_actual = X.copy()
+X_healthy = X.copy()
+X_healthy[:, 0] = soh_ref
+
+mpg_actual = gam.predict(X_actual)
+mpg_healthy = gam.predict(X_healthy)
+
+fc_actual = 1 / mpg_actual
+fc_healthy = 1 / mpg_healthy
+
+df["FC_SOH_est_pct"] = 100 * (fc_actual - fc_healthy) / fc_healthy
+
+df["FC_SOH_est_pct_365d"] = (
+    df["FC_SOH_est_pct"]
+    .rolling(window=ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS)
+    .mean()
+)
+
+df["FC_SOH_est_pct_ewm"] = (
+    df["FC_SOH_est_pct"]
+    .ewm(span=EWMA_SPAN, adjust=False)
+    .mean()
+)
+
+plt.figure(figsize=(10, 6))
+plt.plot(df["age_years"], df["FC_SOH_true_pct"], linewidth=3, label="Actual generator curve")
+plt.plot(df["age_years"], df["FC_SOH_est_pct"], alpha=0.18, label="Direct GAM output")
+plt.plot(df["age_years"], df["FC_SOH_est_pct_365d"], linewidth=2, label="365-day rolling average")
+plt.plot(df["age_years"], df["FC_SOH_est_pct_ewm"], linewidth=2, linestyle="--", label=f"EWMA")
+plt.xlabel("Vehicle age (years)")
+plt.ylabel("% increase in fuel consumption")
+plt.title("Time-Dependent SOH Fuel-Consumption Impact")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+
+if SAVE_PLOTS:
+    plt.savefig(f"{PLOTS_FOLDER}/section5_soh_time_series_comparison.png", dpi=600, bbox_inches="tight")
+
+plt.show()
+
+year_marks = np.arange(1, int(np.round(df["age_years"].max())) + 1)
+
+yearly_rows = []
+
+for year in year_marks:
+    idx = (df["age_years"] - year).abs().idxmin()
+    row = df.loc[idx]
+
+    yearly_rows.append({
+        "Year": int(year),
+        "Actual_generator_pct": row["FC_SOH_true_pct"],
+        "Direct_GAM_pct": row["FC_SOH_est_pct"],
+        "Rolling_365d_pct": row["FC_SOH_est_pct_365d"],
+        "EWMA_pct": row["FC_SOH_est_pct_ewm"],
+    })
+
+yearly_df = pd.DataFrame(yearly_rows)
+
+df_valid = df.dropna(subset=[
+    "FC_SOH_true_pct",
+    "FC_SOH_est_pct",
+    "FC_SOH_est_pct_365d",
+    "FC_SOH_est_pct_ewm",
+])
+
+mae_gam = mae(df_valid["FC_SOH_true_pct"], df_valid["FC_SOH_est_pct"])
+mae_roll = mae(df_valid["FC_SOH_true_pct"], df_valid["FC_SOH_est_pct_365d"])
+mae_ewm = mae(df_valid["FC_SOH_true_pct"], df_valid["FC_SOH_est_pct_ewm"])
+
+rmse_gam = rmse(df_valid["FC_SOH_true_pct"], df_valid["FC_SOH_est_pct"])
+rmse_roll = rmse(df_valid["FC_SOH_true_pct"], df_valid["FC_SOH_est_pct_365d"])
+rmse_ewm = rmse(df_valid["FC_SOH_true_pct"], df_valid["FC_SOH_est_pct_ewm"])
+
+yearly_df.to_csv("data/section5_yearly_soh_estimates.csv", index=False)
+df.to_csv("data/section5_soh_comparison_outputs.csv", index=False)
+
+print("\nSOH estimation error vs true generator:")
+print(f"Direct GAM      -> MAE: {mae_gam:.3f}, RMSE: {rmse_gam:.3f}")
+print(f"365-day average -> MAE: {mae_roll:.3f}, RMSE: {rmse_roll:.3f}")
+print(f"EWMA            -> MAE: {mae_ewm:.3f}, RMSE: {rmse_ewm:.3f}")
+
+print("\nSOH fuel-consumption impact estimates at 1-year intervals:")
+print(yearly_df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+print("\nSaved:")
+print("data/section5_yearly_soh_estimates.csv")
+print("data/section5_soh_comparison_outputs.csv")
+print("\nDone.")
